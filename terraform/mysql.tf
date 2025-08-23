@@ -1,6 +1,6 @@
 provider "mysql" {
-  endpoint = "localhost:3306"
-  username = "root"
+  endpoint = var.mysql_endpoint
+  username = var.mysql_root_username
   password = var.mysql_root_password
 }
 

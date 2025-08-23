@@ -40,11 +40,22 @@ variable "docker_network" {
 }
 
 # MySQL Variables
+variable "mysql_endpoint" {
+  type        = string
+  description = "MySQL server endpoint"
+}
+variable "mysql_root_username" {
+  type        = string
+  default     = "root"
+  description = "Root username for MySQL"
+}
 variable "mysql_root_password" {
   type        = string
   sensitive   = true
   description = "Root password for MySQL"
 }
+
+# Nextcloud Variables
 variable "nextcloud_db_username" {
   type        = string
   description = "Database username for Nextcloud"
@@ -54,8 +65,6 @@ variable "nextcloud_db_password" {
   sensitive   = true
   description = "Database password for Nextcloud"
 }
-
-# Nextcloud Variables
 variable "nextcloud_username" {
   type        = string
   description = "Admin username for Nextcloud"
