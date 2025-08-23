@@ -11,9 +11,9 @@ resource "mysql_database" "nextcloud" {
 }
 
 resource "mysql_user" "nextcloud" {
-  user               = var.nextcloud_db_username.value
+  user               = var.nextcloud_db_username
   host               = "172.22.0.5"
-  plaintext_password = var.nextcloud_db_password.value
+  plaintext_password = var.nextcloud_db_password
 }
 
 resource "mysql_grant" "nextcloud" {
