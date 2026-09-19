@@ -1,5 +1,5 @@
 resource "docker_image" "nextcloud" {
-  name         = "nextcloud:27.1.3-apache"
+  name         = "nextcloud:31.0.8-apache"
   keep_locally = true
 }
 
@@ -8,7 +8,12 @@ resource "docker_container" "nextcloud" {
   name          = "organize-me-nextcloud"
   hostname      = "nextcloud"
   restart       = "unless-stopped"
+  network_mode  = "bridge"
+
+  user = "33:33"
+
   env   = [
+    "PHP_MEMORY_LIMIT=1G",
     "TZ=${var.timezone}",
     "MYSQL_HOST=mysql",
     "DB_PORT=3306",
@@ -34,11 +39,53 @@ resource "docker_container" "nextcloud" {
   networks_advanced {
     name    = data.docker_network.network.name
     aliases = ["nextcloud"]
-    ipv4_address = "172.22.0.5"
   }
   ports {
     internal = 80
     external = 8000
   }
-  depends_on = [mysql_grant.nextcloud, mysql_user.nextcloud, mysql_database.nextcloud]
+
+  depends_on = [
+    mysql_grant.nextcloud,
+    mysql_user.nextcloud,
+    mysql_database.nextcloud
+  ]
 }
+
+resource "docker_container" "nextcloud_worker" {
+  image         = docker_image.nextcloud.image_id
+  name          = "organize-me-nextcloud-worker"
+  user          = "33:33"
+  restart       = "unless-stopped"
+  network_mode  = "bridge"
+
+  command = ["php", "occ", "background-job:worker", "-v", "--interval", "10", "OC\\TaskProcessing\\SynchronousBackgroundJob"]
+
+  env = [
+    "PHP_MEMORY_LIMIT=1G",
+    "TZ=${var.timezone}",
+    "MYSQL_HOST=mysql",
+    "DB_PORT=3306",
+    "MYSQL_USER=${var.nextcloud_db_username}",
+    "MYSQL_PASSWORD=${var.nextcloud_db_password}",
+    "MYSQL_DATABASE=nextcloud"
+  ]
+
+  volumes {
+    container_path = "/var/www/html/"
+    host_path      = "${var.install_root}/nextcloud/var/www/html"
+  }
+
+  networks_advanced {
+    name    = data.docker_network.network.name
+    aliases = ["nextcloud-worker"]
+  }
+
+  depends_on = [
+    docker_container.nextcloud
+  ]
+
+  cpu_shares = 512           # 50% priority relative to other containers
+  memory     = 536870912     # 512 MB
+}
+

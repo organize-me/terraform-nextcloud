@@ -12,7 +12,7 @@ resource "mysql_database" "nextcloud" {
 
 resource "mysql_user" "nextcloud" {
   user               = var.nextcloud_db_username
-  host               = "172.22.0.5"
+  host               = "%"
   plaintext_password = var.nextcloud_db_password
 }
 
