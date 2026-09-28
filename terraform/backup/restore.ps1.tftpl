@@ -1,0 +1,278 @@
+#Requires -Version 5.1
+# Restores Nextcloud (database, config, data, themes, custom apps) from S3.
+# Rendered by Terraform from terraform/backup/restore.ps1.tftpl. Do not edit the rendered copy.
+$ErrorActionPreference = 'Stop'
+
+$NextcloudContainer = '${replace(TF_NEXTCLOUD_CONTAINER_NAME, "'", "''")}'
+$WorkerContainer    = '${replace(TF_NEXTCLOUD_WORKER_CONTAINER_NAME, "'", "''")}'
+$NextcloudImage     = '${replace(TF_NEXTCLOUD_IMAGE, "'", "''")}'
+$Directories        = '${replace(TF_NEXTCLOUD_DIRECTORIES, "'", "''")}' -split ' '
+$DockerNetwork      = '${replace(TF_DOCKER_NETWORK, "'", "''")}'
+$MysqlImage         = '${replace(TF_MYSQL_IMAGE, "'", "''")}'
+$MysqlHost          = '${replace(TF_MYSQL_HOST, "'", "''")}'
+$MysqlPort          = '${TF_MYSQL_PORT}'
+$MysqlUser          = '${replace(TF_MYSQL_USER, "'", "''")}'
+$MysqlPassword      = '${replace(TF_MYSQL_PASSWORD, "'", "''")}'
+$MysqlDatabase      = '${replace(TF_MYSQL_DATABASE, "'", "''")}'
+$AwsCliImage        = '${replace(TF_AWS_CLI_IMAGE, "'", "''")}'
+$S3Bucket           = '${replace(TF_S3_BACKUP_BUCKET, "'", "''")}'
+$ArchiveName        = '${replace(TF_ARCHIVE_NAME, "'", "''")}'
+$DatabaseBackupName = '${replace(TF_DATABASE_BACKUP_NAME, "'", "''")}'
+$TempDir            = Join-Path '${replace(TF_BACKUP_TMP_DIR, "'", "''")}' "nextcloud-restore.$PID"
+%{ for name, value in TF_AWS_ENVIRONMENT ~}
+if (-not $env:${name}) { $env:${name} = '${replace(value, "'", "''")}' }
+%{ endfor ~}
+
+$script:MaintenanceEnabled = $false
+$script:WorkerStopped = $false
+$script:RestoreDirectories = @()
+
+# Windows PowerShell corrupts binary data piped to and from native commands, so the
+# database and archives are read by containers from a bind mount of $TempDir instead.
+function Invoke-Docker {
+    param(
+        [Parameter(Mandatory = $true)][string]$Failure,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    $ErrorActionPreference = 'Continue'
+    & docker @Arguments
+    if ($LASTEXITCODE -ne 0) { throw $Failure }
+}
+
+function Invoke-Occ {
+    param([string]$Failure, [string[]]$OccArguments)
+    Invoke-Docker $Failure (@('exec', '--user', 'www-data', $NextcloudContainer, 'php', 'occ') + $OccArguments)
+}
+
+function Get-TempMount {
+    param([string]$Target = '/backup', [switch]$ReadOnly)
+    $mount = "type=bind,source=$TempDir,target=$Target"
+    if ($ReadOnly) { $mount += ',readonly' }
+    return $mount
+}
+
+function Invoke-Mysql {
+    param([string]$Failure, [string[]]$MysqlArguments)
+    $env:MYSQL_PWD = $MysqlPassword
+    try {
+        Invoke-Docker $Failure (@(
+                'run', '--rm', '--name', 'nextcloud_restore_db',
+                '--network', $DockerNetwork,
+                '--env', 'MYSQL_PWD',
+                '--mount', (Get-TempMount -ReadOnly),
+                '--entrypoint', 'mysql',
+                $MysqlImage,
+                '--default-character-set=utf8mb4',
+                "--host=$MysqlHost", "--port=$MysqlPort", "--user=$MysqlUser"
+            ) + $MysqlArguments + @($MysqlDatabase))
+    } finally {
+        Remove-Item Env:\MYSQL_PWD -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-Cleanup {
+    Write-Host 'Cleanup Start'
+    $failed = $false
+
+    if (Test-Path -LiteralPath $TempDir) {
+        Write-Host 'Deleting temporary directory'
+        try { Remove-Item -LiteralPath $TempDir -Recurse -Force } catch { Write-Host $_; $failed = $true }
+    }
+
+    if ($script:MaintenanceEnabled) {
+        Write-Host 'Disabling maintenance mode'
+        try { Invoke-Occ 'Failed to disable maintenance mode' @('maintenance:mode', '--off') | Out-Host } catch { Write-Host $_; $failed = $true }
+        $script:MaintenanceEnabled = $false
+    }
+
+    if ($script:WorkerStopped) {
+        Write-Host 'Starting nextcloud worker container'
+        try { Invoke-Docker 'Failed to start nextcloud worker container' @('start', $WorkerContainer) | Out-Null } catch { Write-Host $_; $failed = $true }
+        $script:WorkerStopped = $false
+    }
+
+    Write-Host 'Cleanup Complete'
+    return -not $failed
+}
+
+# Put Nextcloud into a consistent state
+function Invoke-Prepare {
+    Write-Host 'Stopping nextcloud worker container'
+    Invoke-Docker 'Failed to stop nextcloud worker container' @('stop', $WorkerContainer) | Out-Null
+    $script:WorkerStopped = $true
+
+    Write-Host 'Enabling maintenance mode'
+    Invoke-Occ 'Failed to enable maintenance mode' @('maintenance:mode', '--on')
+    $script:MaintenanceEnabled = $true
+}
+
+function Receive-ArchiveFromS3 {
+    Write-Host 'Download Start'
+
+    New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
+
+    $arguments = @(
+        'run', '--rm', '--name', 'nextcloud_restore_download',
+        '--network', $DockerNetwork,
+        '--mount', (Get-TempMount -Target '/tmp/restore')
+    )
+    foreach ($name in 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_DEFAULT_REGION', 'AWS_REGION', 'AWS_PROFILE') {
+        $arguments += @('--env', $name)
+    }
+    $awsDir = Join-Path $env:USERPROFILE '.aws'
+    if (Test-Path -LiteralPath $awsDir -PathType Container) {
+        $arguments += @('--mount', "type=bind,source=$awsDir,target=/root/.aws,readonly")
+    }
+    $arguments += $AwsCliImage
+    if ($env:AWS_S3_ENDPOINT_URL) {
+        $arguments += @('--endpoint-url', $env:AWS_S3_ENDPOINT_URL)
+    }
+    $arguments += @('s3', 'cp', "s3://$S3Bucket/$ArchiveName", "/tmp/restore/$ArchiveName")
+
+    Invoke-Docker 'Unable to download backup archive from S3' $arguments
+
+    Write-Host 'Download Complete'
+}
+
+function Expand-BackupArchive {
+    Write-Host 'Extracting backup archive'
+
+    New-Item -ItemType Directory -Path (Join-Path $TempDir 'data') -Force | Out-Null
+    Invoke-Docker 'Failed to decompress backup archive' @(
+        'run', '--rm', '--name', 'nextcloud_restore_extract',
+        '--network', 'none',
+        '--mount', (Get-TempMount),
+        '--entrypoint', 'tar',
+        $NextcloudImage,
+        '-C', '/backup/data', '-xzf', "/backup/$ArchiveName"
+    )
+
+    if (-not (Test-Path -LiteralPath (Join-Path $TempDir "data\$DatabaseBackupName") -PathType Leaf)) {
+        throw "Backup archive does not contain $DatabaseBackupName"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $TempDir 'data\files.tar') -PathType Leaf)) {
+        throw 'Backup archive does not contain files.tar'
+    }
+
+    $archived = @(Invoke-Docker 'Failed to list files.tar' @(
+            'run', '--rm', '--name', 'nextcloud_restore_list',
+            '--network', 'none',
+            '--mount', (Get-TempMount -ReadOnly),
+            '--entrypoint', 'sh',
+            $NextcloudImage,
+            '-c', "tar -tf /backup/data/files.tar | sed 's#^[.]/##' | cut -d/ -f1 | sort -u"
+        ))
+
+    foreach ($directory in $Directories) {
+        if ($archived -ccontains $directory) {
+            $script:RestoreDirectories += $directory
+        } else {
+            Write-Host "Skipping $directory; it is not in the backup archive"
+        }
+    }
+
+    # Nextcloud cannot be restored without its config and data directories
+    foreach ($directory in 'config', 'data') {
+        if ($script:RestoreDirectories -cnotcontains $directory) {
+            throw "Backup archive does not contain the $directory directory"
+        }
+    }
+}
+
+function Restore-Database {
+    Write-Host 'Database Restore Start'
+
+    # Drop existing tables so tables created after the backup do not survive the restore
+    $dropStatements = @(Invoke-Mysql 'Failed to list existing database tables' @(
+            '--batch', '--skip-column-names',
+            "--execute=SELECT CONCAT('DROP TABLE IF EXISTS ', CHAR(96), table_name, CHAR(96), ';') FROM information_schema.tables WHERE table_schema = DATABASE()"
+        ))
+
+    $sqlLines = @('SET FOREIGN_KEY_CHECKS=0;') + $dropStatements + @("SOURCE /backup/data/$DatabaseBackupName;")
+    [IO.File]::WriteAllText((Join-Path $TempDir 'restore.sql'), (($sqlLines -join "`n") + "`n"), (New-Object Text.UTF8Encoding $false))
+
+    Invoke-Mysql 'Failed to restore database' @('--execute=SOURCE /backup/restore.sql')
+
+    Write-Host 'Database Restore Complete'
+}
+
+function Restore-Files {
+    Write-Host 'File Restore Start'
+
+    foreach ($directory in $script:RestoreDirectories) {
+        Write-Host "Removing current $directory"
+        Invoke-Docker "Failed to remove $directory" @('exec', '--user', 'root', $NextcloudContainer, 'rm', '-rf', "/var/www/html/$directory")
+    }
+
+    # tar restores ownership and permissions as backed up
+    Write-Host "Restoring $($script:RestoreDirectories -join ' ')"
+    Invoke-Docker 'Failed to restore files into nextcloud container' (@(
+            'run', '--rm', '--name', 'nextcloud_restore_files',
+            '--network', 'none',
+            '--user', 'root',
+            '--volumes-from', $NextcloudContainer,
+            '--mount', (Get-TempMount -ReadOnly),
+            '--entrypoint', 'tar',
+            $NextcloudImage,
+            '-C', '/var/www/html', '--numeric-owner', '-xpf', '/backup/data/files.tar'
+        ) + $script:RestoreDirectories)
+
+    Write-Host 'File Restore Complete'
+}
+
+function Set-TargetDatabaseConfig {
+    Write-Host 'Setting database connection for this deployment'
+    $php = @'
+$CONFIG = [];
+$configFile = '/var/www/html/config/config.php';
+include $configFile;
+$settings = [
+    'dbhost' => getenv('MYSQL_HOST'),
+    'dbport' => getenv('DB_PORT'),
+    'dbname' => getenv('MYSQL_DATABASE'),
+    'dbuser' => getenv('MYSQL_USER'),
+    'dbpassword' => getenv('MYSQL_PASSWORD'),
+];
+foreach ($settings as $key => $value) {
+    if ($value === false) {
+        fwrite(STDERR, "Missing target database environment value for $key\n");
+        exit(1);
+    }
+    $CONFIG[$key] = $value;
+}
+if (file_put_contents($configFile, "<?php\n" . '$CONFIG = ' . var_export($CONFIG, true) . ";\n") === false) {
+    fwrite(STDERR, "Failed to write target database settings\n");
+    exit(1);
+}
+'@
+    $encodedPhp = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($php))
+    Invoke-Docker 'Failed to set database connection for this deployment' @(
+        'exec', '--user', 'www-data', $NextcloudContainer,
+        'php', '-r', "eval(base64_decode('$encodedPhp'));"
+    )
+}
+
+$stopwatch = [Diagnostics.Stopwatch]::StartNew()
+$exitCode = 0
+try {
+    Invoke-Prepare
+    Receive-ArchiveFromS3
+    Expand-BackupArchive
+    Restore-Database
+    Restore-Files
+    Set-TargetDatabaseConfig
+
+    Write-Host 'Updating data fingerprint'
+    Invoke-Occ 'Failed to update data fingerprint' @('maintenance:data-fingerprint')
+} catch {
+    Write-Host "Restore Failed: $($_.Exception.Message)"
+    $exitCode = 1
+} finally {
+    if (-not (Invoke-Cleanup)) {
+        if ($exitCode -eq 0) { Write-Host 'Restore Failed: cleanup did not complete' }
+        $exitCode = 1
+    }
+    if ($exitCode -eq 0) { Write-Host 'Restore Complete' }
+    Write-Host "Execution time: $([int]$stopwatch.Elapsed.TotalSeconds) seconds"
+}
+exit $exitCode

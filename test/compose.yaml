@@ -1,0 +1,50 @@
+name: terraform-nextcloud-test
+
+services:
+  mysql:
+    image: mysql:8.0.44
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Run test/start.ps1 to configure test credentials}
+    ports:
+      - "127.0.0.1:33306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - test
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -uroot -p\"$$MYSQL_ROOT_PASSWORD\" -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports:
+      - "127.0.0.1:18025:8025"
+    networks:
+      - test
+
+  # S3-compatible endpoint for the backup/restore scripts (http://s3:9090 on the test network).
+  # 3.12.0 is the newest S3Mock release that accepts uploads from the pinned amazon/aws-cli:2.18.9 image.
+  s3:
+    image: adobe/s3mock:3.12.0
+    environment:
+      initialBuckets: organize-me.localhost.backups
+      root: /s3mock
+      retainFilesOnExit: "true"
+    ports:
+      - "127.0.0.1:19090:9090"
+    volumes:
+      - s3_data:/s3mock
+    networks:
+      test:
+        aliases:
+          - s3
+
+networks:
+  test:
+    name: terraform-nextcloud-test
+
+volumes:
+  mysql_data:
+  s3_data:

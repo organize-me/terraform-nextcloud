@@ -1,0 +1,166 @@
+#!/bin/sh
+
+NEXTCLOUD_CONTAINER="${TF_NEXTCLOUD_CONTAINER_NAME}"
+NEXTCLOUD_WORKER_CONTAINER="${TF_NEXTCLOUD_WORKER_CONTAINER_NAME}"
+NEXTCLOUD_DIRECTORIES="${TF_NEXTCLOUD_DIRECTORIES}"
+TEMP_DIR_HOST="${TF_BACKUP_TMP_DIR}/nextcloud-backup.$$"
+MYSQL_PASSWORD='${replace(TF_MYSQL_PASSWORD, "'", "'\\''")}'
+%{ for name, value in TF_AWS_ENVIRONMENT ~}
+if [ -z "$${${name}}" ]; then ${name}='${replace(value, "'", "'\\''")}'; export ${name}; fi
+%{ endfor ~}
+
+MAINTENANCE_ENABLED=false
+WORKER_STOPPED=false
+
+occ () {
+  docker exec --user www-data "$NEXTCLOUD_CONTAINER" php occ "$@"
+}
+
+# Clean up
+cleanup () {
+  echo "Cleanup Start"
+  CLEANUP_FAILED=0
+  cd "$WORK_DIR" 2> /dev/null
+
+  # Delete the temporary directory
+  if [ -d "$TEMP_DIR_HOST" ]; then
+    echo "Deleting temporary directory"
+    rm -rf "$TEMP_DIR_HOST" || CLEANUP_FAILED=1
+  fi
+
+  if [ "$MAINTENANCE_ENABLED" = "true" ]; then
+    echo "Disabling maintenance mode"
+    occ maintenance:mode --off || CLEANUP_FAILED=1
+    MAINTENANCE_ENABLED=false
+  fi
+
+  if [ "$WORKER_STOPPED" = "true" ]; then
+    echo "Starting nextcloud worker container"
+    docker start "$NEXTCLOUD_WORKER_CONTAINER" > /dev/null || CLEANUP_FAILED=1
+    WORKER_STOPPED=false
+  fi
+
+  echo "Cleanup Complete"
+  return "$CLEANUP_FAILED"
+}
+
+# Halt the script
+halt () {
+  # $1 - Exit code (optional)
+  # $2 - Message (optional)
+
+  if [ -n "$1" ]; then
+    EXIT_CODE=$1
+  else
+    EXIT_CODE=0
+  fi
+
+  cleanup || EXIT_CODE=1
+
+  # Exit
+  if [ "$EXIT_CODE" -ne 0 ]; then
+    if [ -n "$2" ]; then
+      echo "Backup Failed: $2"
+    else
+      echo "Backup Failed"
+    fi
+  fi
+  exit "$EXIT_CODE"
+}
+
+# Put Nextcloud into a consistent state
+prepare () {
+  echo "Stopping nextcloud worker container"
+  docker stop "$NEXTCLOUD_WORKER_CONTAINER" > /dev/null || halt 1 "Failed to stop nextcloud worker container"
+  WORKER_STOPPED=true
+
+  echo "Enabling maintenance mode"
+  occ maintenance:mode --on || halt 1 "Failed to enable maintenance mode"
+  MAINTENANCE_ENABLED=true
+}
+
+# Create backup archive
+backup () {
+  mkdir -p "$TEMP_DIR_HOST/data" || halt 1 "Failed to create temporary directory"
+
+  echo "Database Backup Start"
+  MYSQL_PWD="$MYSQL_PASSWORD" docker run --rm \
+    --name "nextcloud_backup_db" \
+    --network "${TF_DOCKER_NETWORK}" \
+    --env MYSQL_PWD \
+    --entrypoint "mysqldump" \
+    "${TF_MYSQL_IMAGE}" \
+    --single-transaction --no-tablespaces --default-character-set=utf8mb4 \
+    --host="${TF_MYSQL_HOST}" --port="${TF_MYSQL_PORT}" --user="${TF_MYSQL_USER}" "${TF_MYSQL_DATABASE}" \
+    > "$TEMP_DIR_HOST/data/${TF_DATABASE_BACKUP_NAME}" || halt 1 "Failed to backup database"
+  echo "Database Backup Complete"
+
+  echo "File Backup Start"
+  # Stream a tar from the container so ownership and permissions are preserved
+  # (docker cp through a Windows host loses Unix file modes).
+  # shellcheck disable=SC2086
+  docker exec --user root "$NEXTCLOUD_CONTAINER" \
+    tar -C /var/www/html --numeric-owner -cf - $NEXTCLOUD_DIRECTORIES \
+    > "$TEMP_DIR_HOST/data/files.tar" || halt 1 "Failed to archive $NEXTCLOUD_DIRECTORIES from nextcloud container"
+  echo "File Backup Complete"
+
+  echo "Creating backup archive"
+  cd "$TEMP_DIR_HOST" || halt 1 "Failed to change directory"
+  tar -czf "${TF_ARCHIVE_NAME}" -C data . || halt 1 "Failed to create backup archive"
+  cd "$WORK_DIR" || halt 1 "Failed to change directory"
+}
+
+# Upload backup to S3
+upload_archive_to_s3 () {
+  echo "Upload Start"
+
+  TEMP_DIR_AWSCLI="/tmp/backup"
+
+  set -- "--rm"
+  set -- "$@" "--name" "nextcloud_backup_upload"
+  set -- "$@" "--network" "${TF_DOCKER_NETWORK}"
+  set -- "$@" "--volume" "$TEMP_DIR_HOST:$TEMP_DIR_AWSCLI:ro"
+  set -- "$@" "--env" "AWS_ACCESS_KEY_ID"
+  set -- "$@" "--env" "AWS_SECRET_ACCESS_KEY"
+  set -- "$@" "--env" "AWS_SESSION_TOKEN"
+  set -- "$@" "--env" "AWS_DEFAULT_REGION"
+  set -- "$@" "--env" "AWS_REGION"
+  set -- "$@" "--env" "AWS_PROFILE"
+
+  # AWS Directory (if exists)
+  if [ -d "$HOME/.aws" ]; then
+    set -- "$@" "--volume" "$HOME/.aws:/root/.aws:ro"
+  fi
+
+  set -- "$@" "${TF_AWS_CLI_IMAGE}"
+
+  if [ -n "$AWS_S3_ENDPOINT_URL" ]; then
+    set -- "$@" "--endpoint-url" "$AWS_S3_ENDPOINT_URL"
+  fi
+
+  set -- "$@" "s3" "cp" "$TEMP_DIR_AWSCLI/${TF_ARCHIVE_NAME}" "s3://${TF_S3_BACKUP_BUCKET}/${TF_ARCHIVE_NAME}"
+
+  docker run "$@" || halt 1 "Unable to upload backup archive to S3"
+
+  echo "Upload Complete"
+}
+
+run () {
+  WORK_DIR=$(pwd)
+
+  prepare
+  backup
+  upload_archive_to_s3
+  cleanup || exit 1
+
+  echo "Backup Complete"
+}
+
+# Capture start time
+START_TIME=$(date +%s)
+
+# Ensure elapsed time is displayed on exit
+trap 'ELAPSED_TIME=$(($(date +%s) - START_TIME)); echo "Execution time: $ELAPSED_TIME seconds"' EXIT
+
+# Run the backup process
+run

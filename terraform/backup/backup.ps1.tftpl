@@ -1,0 +1,179 @@
+#Requires -Version 5.1
+# Backs up Nextcloud (database, config, data, themes, custom apps) to S3.
+# Rendered by Terraform from terraform/backup/backup.ps1.tftpl. Do not edit the rendered copy.
+$ErrorActionPreference = 'Stop'
+
+$NextcloudContainer = '${replace(TF_NEXTCLOUD_CONTAINER_NAME, "'", "''")}'
+$WorkerContainer    = '${replace(TF_NEXTCLOUD_WORKER_CONTAINER_NAME, "'", "''")}'
+$NextcloudImage     = '${replace(TF_NEXTCLOUD_IMAGE, "'", "''")}'
+$Directories        = '${replace(TF_NEXTCLOUD_DIRECTORIES, "'", "''")}' -split ' '
+$DockerNetwork      = '${replace(TF_DOCKER_NETWORK, "'", "''")}'
+$MysqlImage         = '${replace(TF_MYSQL_IMAGE, "'", "''")}'
+$MysqlHost          = '${replace(TF_MYSQL_HOST, "'", "''")}'
+$MysqlPort          = '${TF_MYSQL_PORT}'
+$MysqlUser          = '${replace(TF_MYSQL_USER, "'", "''")}'
+$MysqlPassword      = '${replace(TF_MYSQL_PASSWORD, "'", "''")}'
+$MysqlDatabase      = '${replace(TF_MYSQL_DATABASE, "'", "''")}'
+$AwsCliImage        = '${replace(TF_AWS_CLI_IMAGE, "'", "''")}'
+$S3Bucket           = '${replace(TF_S3_BACKUP_BUCKET, "'", "''")}'
+$ArchiveName        = '${replace(TF_ARCHIVE_NAME, "'", "''")}'
+$DatabaseBackupName = '${replace(TF_DATABASE_BACKUP_NAME, "'", "''")}'
+$TempDir            = Join-Path '${replace(TF_BACKUP_TMP_DIR, "'", "''")}' "nextcloud-backup.$PID"
+%{ for name, value in TF_AWS_ENVIRONMENT ~}
+if (-not $env:${name}) { $env:${name} = '${replace(value, "'", "''")}' }
+%{ endfor ~}
+
+$script:MaintenanceEnabled = $false
+$script:WorkerStopped = $false
+
+# Windows PowerShell corrupts binary data piped from native commands, so dumps and
+# archives are written by containers into a bind mount of $TempDir instead.
+function Invoke-Docker {
+    param(
+        [Parameter(Mandatory = $true)][string]$Failure,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    $ErrorActionPreference = 'Continue'
+    & docker @Arguments
+    if ($LASTEXITCODE -ne 0) { throw $Failure }
+}
+
+function Invoke-Occ {
+    param([string]$Failure, [string[]]$OccArguments)
+    Invoke-Docker $Failure (@('exec', '--user', 'www-data', $NextcloudContainer, 'php', 'occ') + $OccArguments)
+}
+
+function Get-TempMount {
+    param([string]$Target = '/backup', [switch]$ReadOnly)
+    $mount = "type=bind,source=$TempDir,target=$Target"
+    if ($ReadOnly) { $mount += ',readonly' }
+    return $mount
+}
+
+function Invoke-Cleanup {
+    Write-Host 'Cleanup Start'
+    $failed = $false
+
+    if (Test-Path -LiteralPath $TempDir) {
+        Write-Host 'Deleting temporary directory'
+        try { Remove-Item -LiteralPath $TempDir -Recurse -Force } catch { Write-Host $_; $failed = $true }
+    }
+
+    if ($script:MaintenanceEnabled) {
+        Write-Host 'Disabling maintenance mode'
+        try { Invoke-Occ 'Failed to disable maintenance mode' @('maintenance:mode', '--off') | Out-Host } catch { Write-Host $_; $failed = $true }
+        $script:MaintenanceEnabled = $false
+    }
+
+    if ($script:WorkerStopped) {
+        Write-Host 'Starting nextcloud worker container'
+        try { Invoke-Docker 'Failed to start nextcloud worker container' @('start', $WorkerContainer) | Out-Null } catch { Write-Host $_; $failed = $true }
+        $script:WorkerStopped = $false
+    }
+
+    Write-Host 'Cleanup Complete'
+    return -not $failed
+}
+
+# Put Nextcloud into a consistent state
+function Invoke-Prepare {
+    Write-Host 'Stopping nextcloud worker container'
+    Invoke-Docker 'Failed to stop nextcloud worker container' @('stop', $WorkerContainer) | Out-Null
+    $script:WorkerStopped = $true
+
+    Write-Host 'Enabling maintenance mode'
+    Invoke-Occ 'Failed to enable maintenance mode' @('maintenance:mode', '--on')
+    $script:MaintenanceEnabled = $true
+}
+
+function Invoke-Backup {
+    New-Item -ItemType Directory -Path (Join-Path $TempDir 'data') -Force | Out-Null
+
+    Write-Host 'Database Backup Start'
+    $env:MYSQL_PWD = $MysqlPassword
+    try {
+        Invoke-Docker 'Failed to backup database' @(
+            'run', '--rm', '--name', 'nextcloud_backup_db',
+            '--network', $DockerNetwork,
+            '--env', 'MYSQL_PWD',
+            '--mount', (Get-TempMount),
+            '--entrypoint', 'mysqldump',
+            $MysqlImage,
+            '--single-transaction', '--no-tablespaces', '--default-character-set=utf8mb4',
+            "--host=$MysqlHost", "--port=$MysqlPort", "--user=$MysqlUser",
+            "--result-file=/backup/data/$DatabaseBackupName", $MysqlDatabase
+        )
+    } finally {
+        Remove-Item Env:\MYSQL_PWD -ErrorAction SilentlyContinue
+    }
+    Write-Host 'Database Backup Complete'
+
+    # tar keeps ownership and permissions, matching rsync -A in the Nextcloud backup guide
+    Write-Host 'File Backup Start'
+    Invoke-Docker "Failed to archive $Directories from nextcloud container" (@(
+            'run', '--rm', '--name', 'nextcloud_backup_files',
+            '--network', 'none',
+            '--user', 'root',
+            '--volumes-from', $NextcloudContainer,
+            '--mount', (Get-TempMount),
+            '--entrypoint', 'tar',
+            $NextcloudImage,
+            '-C', '/var/www/html', '--numeric-owner', '-cf', '/backup/data/files.tar'
+        ) + $Directories)
+    Write-Host 'File Backup Complete'
+
+    Write-Host 'Creating backup archive'
+    Invoke-Docker 'Failed to create backup archive' @(
+        'run', '--rm', '--name', 'nextcloud_backup_archive',
+        '--network', 'none',
+        '--mount', (Get-TempMount),
+        '--entrypoint', 'tar',
+        $NextcloudImage,
+        '-C', '/backup/data', '-czf', "/backup/$ArchiveName", '.'
+    )
+}
+
+function Send-ArchiveToS3 {
+    Write-Host 'Upload Start'
+
+    $arguments = @(
+        'run', '--rm', '--name', 'nextcloud_backup_upload',
+        '--network', $DockerNetwork,
+        '--mount', (Get-TempMount -Target '/tmp/backup' -ReadOnly)
+    )
+    foreach ($name in 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_DEFAULT_REGION', 'AWS_REGION', 'AWS_PROFILE') {
+        $arguments += @('--env', $name)
+    }
+    $awsDir = Join-Path $env:USERPROFILE '.aws'
+    if (Test-Path -LiteralPath $awsDir -PathType Container) {
+        $arguments += @('--mount', "type=bind,source=$awsDir,target=/root/.aws,readonly")
+    }
+    $arguments += $AwsCliImage
+    if ($env:AWS_S3_ENDPOINT_URL) {
+        $arguments += @('--endpoint-url', $env:AWS_S3_ENDPOINT_URL)
+    }
+    $arguments += @('s3', 'cp', "/tmp/backup/$ArchiveName", "s3://$S3Bucket/$ArchiveName")
+
+    Invoke-Docker 'Unable to upload backup archive to S3' $arguments
+
+    Write-Host 'Upload Complete'
+}
+
+$stopwatch = [Diagnostics.Stopwatch]::StartNew()
+$exitCode = 0
+try {
+    Invoke-Prepare
+    Invoke-Backup
+    Send-ArchiveToS3
+} catch {
+    Write-Host "Backup Failed: $($_.Exception.Message)"
+    $exitCode = 1
+} finally {
+    if (-not (Invoke-Cleanup)) {
+        if ($exitCode -eq 0) { Write-Host 'Backup Failed: cleanup did not complete' }
+        $exitCode = 1
+    }
+    if ($exitCode -eq 0) { Write-Host 'Backup Complete' }
+    Write-Host "Execution time: $([int]$stopwatch.Elapsed.TotalSeconds) seconds"
+}
+exit $exitCode

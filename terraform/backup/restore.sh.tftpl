@@ -1,0 +1,251 @@
+#!/bin/sh
+
+NEXTCLOUD_CONTAINER="${TF_NEXTCLOUD_CONTAINER_NAME}"
+NEXTCLOUD_WORKER_CONTAINER="${TF_NEXTCLOUD_WORKER_CONTAINER_NAME}"
+NEXTCLOUD_DIRECTORIES="${TF_NEXTCLOUD_DIRECTORIES}"
+TEMP_DIR_HOST="${TF_BACKUP_TMP_DIR}/nextcloud-restore.$$"
+MYSQL_PASSWORD='${replace(TF_MYSQL_PASSWORD, "'", "'\\''")}'
+%{ for name, value in TF_AWS_ENVIRONMENT ~}
+if [ -z "$${${name}}" ]; then ${name}='${replace(value, "'", "'\\''")}'; export ${name}; fi
+%{ endfor ~}
+
+MAINTENANCE_ENABLED=false
+WORKER_STOPPED=false
+
+occ () {
+  docker exec --user www-data "$NEXTCLOUD_CONTAINER" php occ "$@"
+}
+
+mysql_client () {
+  MYSQL_PWD="$MYSQL_PASSWORD" docker run --rm -i \
+    --name "nextcloud_restore_db" \
+    --network "${TF_DOCKER_NETWORK}" \
+    --env MYSQL_PWD \
+    --entrypoint "mysql" \
+    "${TF_MYSQL_IMAGE}" \
+    --default-character-set=utf8mb4 \
+    --host="${TF_MYSQL_HOST}" --port="${TF_MYSQL_PORT}" --user="${TF_MYSQL_USER}" \
+    "$@" "${TF_MYSQL_DATABASE}"
+}
+
+# Clean up
+cleanup () {
+  echo "Cleanup Start"
+  CLEANUP_FAILED=0
+  cd "$WORK_DIR" 2> /dev/null
+
+  # Delete the temporary directory
+  if [ -d "$TEMP_DIR_HOST" ]; then
+    echo "Deleting temporary directory"
+    rm -rf "$TEMP_DIR_HOST" || CLEANUP_FAILED=1
+  fi
+
+  if [ "$MAINTENANCE_ENABLED" = "true" ]; then
+    echo "Disabling maintenance mode"
+    occ maintenance:mode --off || CLEANUP_FAILED=1
+    MAINTENANCE_ENABLED=false
+  fi
+
+  if [ "$WORKER_STOPPED" = "true" ]; then
+    echo "Starting nextcloud worker container"
+    docker start "$NEXTCLOUD_WORKER_CONTAINER" > /dev/null || CLEANUP_FAILED=1
+    WORKER_STOPPED=false
+  fi
+
+  echo "Cleanup Complete"
+  return "$CLEANUP_FAILED"
+}
+
+# Halt the script
+halt () {
+  # $1 - Exit code (optional)
+  # $2 - Message (optional)
+
+  if [ -n "$1" ]; then
+    EXIT_CODE=$1
+  else
+    EXIT_CODE=0
+  fi
+
+  cleanup || EXIT_CODE=1
+
+  # Exit
+  if [ "$EXIT_CODE" -ne 0 ]; then
+    if [ -n "$2" ]; then
+      echo "Restore Failed: $2"
+    else
+      echo "Restore Failed"
+    fi
+  fi
+  exit "$EXIT_CODE"
+}
+
+# Put Nextcloud into a consistent state
+prepare () {
+  echo "Stopping nextcloud worker container"
+  docker stop "$NEXTCLOUD_WORKER_CONTAINER" > /dev/null || halt 1 "Failed to stop nextcloud worker container"
+  WORKER_STOPPED=true
+
+  echo "Enabling maintenance mode"
+  occ maintenance:mode --on || halt 1 "Failed to enable maintenance mode"
+  MAINTENANCE_ENABLED=true
+}
+
+download () {
+  echo "Download Start"
+
+  # Create temporary directory
+  mkdir -p "$TEMP_DIR_HOST" || halt 1 "Failed to create temporary directory"
+
+  TEMP_DIR_AWSCLI="/tmp/restore"
+
+  set -- "--rm"
+  set -- "$@" "--name" "nextcloud_restore_download"
+  set -- "$@" "--network" "${TF_DOCKER_NETWORK}"
+  set -- "$@" "--volume" "$TEMP_DIR_HOST:$TEMP_DIR_AWSCLI"
+  set -- "$@" "--env" "AWS_ACCESS_KEY_ID"
+  set -- "$@" "--env" "AWS_SECRET_ACCESS_KEY"
+  set -- "$@" "--env" "AWS_SESSION_TOKEN"
+  set -- "$@" "--env" "AWS_DEFAULT_REGION"
+  set -- "$@" "--env" "AWS_REGION"
+  set -- "$@" "--env" "AWS_PROFILE"
+
+  # AWS Directory (if exists)
+  if [ -d "$HOME/.aws" ]; then
+    set -- "$@" "--volume" "$HOME/.aws:/root/.aws:ro"
+  fi
+
+  set -- "$@" "${TF_AWS_CLI_IMAGE}"
+
+  if [ -n "$AWS_S3_ENDPOINT_URL" ]; then
+    set -- "$@" "--endpoint-url" "$AWS_S3_ENDPOINT_URL"
+  fi
+
+  set -- "$@" "s3" "cp" "s3://${TF_S3_BACKUP_BUCKET}/${TF_ARCHIVE_NAME}" "$TEMP_DIR_AWSCLI/${TF_ARCHIVE_NAME}"
+
+  docker run "$@" || halt 1 "Unable to download backup archive from S3"
+
+  echo "Download Complete"
+}
+
+extract () {
+  echo "Extracting backup archive"
+
+  mkdir -p "$TEMP_DIR_HOST/data" || halt 1 "Failed to create data directory"
+  cd "$TEMP_DIR_HOST" || halt 1 "Failed to change directory"
+  tar -xzf "${TF_ARCHIVE_NAME}" -C data || halt 1 "Failed to decompress backup archive"
+  cd "$WORK_DIR" || halt 1 "Failed to change directory"
+
+  [ -f "$TEMP_DIR_HOST/data/${TF_DATABASE_BACKUP_NAME}" ] || halt 1 "Backup archive does not contain ${TF_DATABASE_BACKUP_NAME}"
+  [ -f "$TEMP_DIR_HOST/data/files.tar" ] || halt 1 "Backup archive does not contain files.tar"
+
+  # Read from stdin: GNU tar treats a "C:" drive prefix as a remote host
+  tar -tf - < "$TEMP_DIR_HOST/data/files.tar" > "$TEMP_DIR_HOST/files.list" || halt 1 "Failed to list files.tar"
+  ARCHIVED_DIRECTORIES=$(sed 's#^\./##' "$TEMP_DIR_HOST/files.list" | cut -d/ -f1 | sort -u)
+  RESTORE_DIRECTORIES=""
+  for DIRECTORY in $NEXTCLOUD_DIRECTORIES; do
+    if printf '%s\n' "$ARCHIVED_DIRECTORIES" | grep -qxF "$DIRECTORY"; then
+      RESTORE_DIRECTORIES="$RESTORE_DIRECTORIES $DIRECTORY"
+    else
+      echo "Skipping $DIRECTORY; it is not in the backup archive"
+    fi
+  done
+
+  # Nextcloud cannot be restored without its config and data directories
+  for DIRECTORY in config data; do
+    case " $RESTORE_DIRECTORIES " in
+      *" $DIRECTORY "*) ;;
+      *) halt 1 "Backup archive does not contain the $DIRECTORY directory" ;;
+    esac
+  done
+}
+
+restore_database () {
+  echo "Database Restore Start"
+
+  # Drop existing tables so tables created after the backup do not survive the restore
+  mysql_client --batch --skip-column-names \
+    --execute='SELECT CONCAT("DROP TABLE IF EXISTS `", table_name, "`;") FROM information_schema.tables WHERE table_schema = DATABASE()' \
+    < /dev/null > "$TEMP_DIR_HOST/drop-tables.sql" || halt 1 "Failed to list existing database tables"
+
+  { echo "SET FOREIGN_KEY_CHECKS=0;"; cat "$TEMP_DIR_HOST/drop-tables.sql" "$TEMP_DIR_HOST/data/${TF_DATABASE_BACKUP_NAME}"; } \
+    | mysql_client || halt 1 "Failed to restore database"
+
+  echo "Database Restore Complete"
+}
+
+restore_files () {
+  echo "File Restore Start"
+
+  for DIRECTORY in $RESTORE_DIRECTORIES; do
+    echo "Removing current $DIRECTORY"
+    docker exec --user root "$NEXTCLOUD_CONTAINER" rm -rf "/var/www/html/$DIRECTORY" || halt 1 "Failed to remove $DIRECTORY"
+  done
+
+  # Stream the tar into the container so ownership and permissions are restored as backed up
+  echo "Restoring$RESTORE_DIRECTORIES"
+  # shellcheck disable=SC2086
+  docker exec -i --user root "$NEXTCLOUD_CONTAINER" \
+    tar -C /var/www/html --numeric-owner -xpf - $RESTORE_DIRECTORIES \
+    < "$TEMP_DIR_HOST/data/files.tar" || halt 1 "Failed to restore files into nextcloud container"
+
+  echo "File Restore Complete"
+}
+
+restore_database_config () {
+  echo "Setting database connection for this deployment"
+  PHP_CODE=$(cat <<'PHP'
+$CONFIG = [];
+$configFile = '/var/www/html/config/config.php';
+include $configFile;
+$settings = [
+    'dbhost' => getenv('MYSQL_HOST'),
+    'dbport' => getenv('DB_PORT'),
+    'dbname' => getenv('MYSQL_DATABASE'),
+    'dbuser' => getenv('MYSQL_USER'),
+    'dbpassword' => getenv('MYSQL_PASSWORD'),
+];
+foreach ($settings as $key => $value) {
+    if ($value === false) {
+        fwrite(STDERR, "Missing target database environment value for $key\n");
+        exit(1);
+    }
+    $CONFIG[$key] = $value;
+}
+if (file_put_contents($configFile, "<?php\n" . '$CONFIG = ' . var_export($CONFIG, true) . ";\n") === false) {
+    fwrite(STDERR, "Failed to write target database settings\n");
+    exit(1);
+}
+PHP
+  ) || halt 1 "Failed to prepare target database settings"
+
+  docker exec --user www-data "$NEXTCLOUD_CONTAINER" php -r "$PHP_CODE" \
+    || halt 1 "Failed to set database connection for this deployment"
+}
+
+run () {
+  WORK_DIR=$(pwd)
+
+  prepare
+  download
+  extract
+  restore_database
+  restore_files
+  restore_database_config
+
+  echo "Updating data fingerprint"
+  occ maintenance:data-fingerprint || halt 1 "Failed to update data fingerprint"
+
+  cleanup || exit 1
+
+  echo "Restore Complete"
+}
+
+# Capture start time
+START_TIME=$(date +%s)
+
+# Ensure elapsed time is displayed on exit
+trap 'ELAPSED_TIME=$(($(date +%s) - START_TIME)); echo "Execution time: $ELAPSED_TIME seconds"' EXIT
+
+# Run the restore process
+run

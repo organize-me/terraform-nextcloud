@@ -6,9 +6,7 @@ provider "registry.terraform.io/bangau1/mysql" {
   constraints = "1.10.4"
   hashes = [
     "h1:PcMepyKh8YwpF12HNFKfxYhrniY25geOSz3VQc5/L24=",
-    "h1:lcyN3Cwyz9l2FyPFKN9cOarEtNETVguScggBGxDz3us=",
     "h1:pDWHVLrIWTDv8hu1ZgVxDako7F0Ou6AIJEBuisnVXI0=",
-    "h1:pIjuWKxJDGSHp/3mud3eVsUFli3CRZuwRInU+JGlDjY=",
     "zh:007ab16749c053908405c7e58952e10aa87be149e37882cdf602b40065b26605",
     "zh:2de5e847cfa6aecc3691bd8aa15031b59eb2b1580019e9b1a29987af563770c3",
     "zh:391170ec47a537f72525c4d903123817fc98231635a74d215ece59a27a3335f2",
@@ -29,8 +27,6 @@ provider "registry.terraform.io/hashicorp/local" {
   version     = "2.9.1"
   constraints = "2.9.1"
   hashes = [
-    "h1:OZGJN0LSSat5QIxZPxDXtVr4XpHb2oG7cVKJhSqBFIE=",
-    "h1:bek0XHcE8X713/1PR+sMKZFwLnamznJdYbORghbFRn0=",
     "h1:qGLHCuYSus+uHNnoEL4SuJqOs5yrNOcB7gnuHoVqizo=",
     "h1:tX/GU6iR6pP5XMj3zo22mIsZEIW2GUZ9GxfVdo2KjoI=",
     "zh:25606c7a5e308144fb627f6e31611bb52ff72bb9ae2d27af39673ab1a6b3c1bf",
@@ -54,9 +50,7 @@ provider "registry.terraform.io/kreuzwerker/docker" {
   constraints = "3.0.1"
   hashes = [
     "h1:0kd7puzZR47pUMK/xynOXbS0ibkURo2U3Q+cvYNKTaE=",
-    "h1:DJSFW/AN4fCLJ9pfNoH4HBF85zpAjFqJ75hZfyzqr2c=",
     "h1:X2wZHQoG54NmtojeFcX0PSJPelaIejQRqyyI2h+LjWg=",
-    "h1:klHEnyIJInoaRJsWkNOVXYKg87/oUmV/uT6SLa38OmQ=",
     "zh:02f60126ca16b344092df3c315296bf1a216c3b2a68eddb3c89fdfa5ea826118",
     "zh:0d2ee9624a54dbc10538b0c4e296348641b9bfba1354b3f872e43f7ec69a75f2",
     "zh:473d7427da8c9efc231266abc7fdc27fca5f9ee0bdfcdb9914f0a2886e3e23b8",

@@ -3,5 +3,15 @@
 
 # Terraform
 terraform/.terraform
+**/.terraform/
 *.tfstate
 *.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+test/.env
+# Generated backup/restore scripts and temporary files
+/bin/
+/tmp/
+/test/bin/
+/test/tmp/
