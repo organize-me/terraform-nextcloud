@@ -4,7 +4,7 @@ locals {
 }
 
 resource "docker_image" "nextcloud" {
-  name         = "nextcloud:34.0.4-apache"
+  name         = "nextcloud:34.0.5-apache"
   keep_locally = true
 }
 
